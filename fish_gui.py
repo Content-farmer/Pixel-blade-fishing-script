@@ -73,28 +73,37 @@ class FishingBot:
     def __init__(self, root):
         self.root = root
         self.root.title("Fishing Automation")
+        self.root.configure(bg="#1e1e1e")
 
         self.running = False
         self.stop_flag = False
         self.holding_key = False
         self.last_rgb_update = 0.0
+        self.max_log_lines = 300
+        self.last_log_message = ""
+        self.last_log_time = 0.0
+        self.last_target_warning = 0.0
 
         # Settings
         self.x_var = tk.IntVar(value=960)
         self.y_var = tk.IntVar(value=540)
         self.key_var = tk.StringVar(value="e")
         self.color_tol_var = tk.IntVar(value=12)
+        self.sample_radius_var = tk.IntVar(value=1)
         self.circle_hits_var = tk.IntVar(value=3)
         self.tap_min_var = tk.IntVar(value=130)
         self.tap_max_var = tk.IntVar(value=170)
         self.phase_timeout_var = tk.IntVar(value=10_000)
         self.use_window_var = tk.BooleanVar(value=True)
-        self.window_proc_var = tk.StringVar(value="RobloxPlayerBeta.exe")
+        self.selected_window_var = tk.StringVar(value="")
+        self.window_choices = []
 
         self.status_var = tk.StringVar(value="Idle")
         self.rgb_var = tk.StringVar(value="RGB: ---")
 
+        self.apply_dark_mode()
         self.build_gui()
+        self.refresh_window_list(log_refresh=False)
 
         # Emergency stop
         self.listener = keyboard.GlobalHotKeys({"<f8>": self.emergency_stop})
@@ -104,6 +113,18 @@ class FishingBot:
     # -------------------------
     # GUI
     # -------------------------
+
+    def apply_dark_mode(self):
+        style = ttk.Style(self.root)
+        style.theme_use("clam")
+        style.configure(".", background="#1e1e1e", foreground="#e6e6e6", fieldbackground="#2a2a2a")
+        style.configure("TLabel", background="#1e1e1e", foreground="#e6e6e6")
+        style.configure("TFrame", background="#1e1e1e")
+        style.configure("TCheckbutton", background="#1e1e1e", foreground="#e6e6e6")
+        style.configure("TButton", background="#2f2f2f", foreground="#f5f5f5")
+        style.map("TButton", background=[("active", "#3b3b3b")])
+        style.configure("TCombobox", fieldbackground="#2a2a2a", foreground="#e6e6e6")
+        style.configure("TEntry", fieldbackground="#2a2a2a", foreground="#e6e6e6")
 
     def build_gui(self):
         frm = ttk.Frame(self.root, padding=10)
@@ -121,55 +142,83 @@ class FishingBot:
         ttk.Label(frm, text="Color Tol ±RGB").grid(row=1, column=2, sticky="w")
         ttk.Entry(frm, textvariable=self.color_tol_var, width=10).grid(row=1, column=3, sticky="w")
 
-        ttk.Label(frm, text="Circle hits").grid(row=2, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.circle_hits_var, width=10).grid(row=2, column=1, sticky="w")
+        ttk.Label(frm, text="Sample radius px").grid(row=2, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.sample_radius_var, width=10).grid(row=2, column=1, sticky="w")
 
-        ttk.Label(frm, text="Tap min ms").grid(row=2, column=2, sticky="w")
-        ttk.Entry(frm, textvariable=self.tap_min_var, width=10).grid(row=2, column=3, sticky="w")
+        ttk.Label(frm, text="Circle hits").grid(row=2, column=2, sticky="w")
+        ttk.Entry(frm, textvariable=self.circle_hits_var, width=10).grid(row=2, column=3, sticky="w")
 
-        ttk.Label(frm, text="Tap max ms").grid(row=3, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.tap_max_var, width=10).grid(row=3, column=1, sticky="w")
+        ttk.Label(frm, text="Tap min ms").grid(row=3, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.tap_min_var, width=10).grid(row=3, column=1, sticky="w")
 
-        ttk.Label(frm, text="Phase timeout ms").grid(row=3, column=2, sticky="w")
-        ttk.Entry(frm, textvariable=self.phase_timeout_var, width=10).grid(row=3, column=3, sticky="w")
+        ttk.Label(frm, text="Tap max ms").grid(row=3, column=2, sticky="w")
+        ttk.Entry(frm, textvariable=self.tap_max_var, width=10).grid(row=3, column=3, sticky="w")
+
+        ttk.Label(frm, text="Phase timeout ms").grid(row=4, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.phase_timeout_var, width=10).grid(row=4, column=1, sticky="w")
 
         ttk.Checkbutton(
             frm,
-            text="Target process window",
+            text="Target selected app window",
             variable=self.use_window_var,
-        ).grid(row=4, column=0, sticky="w")
+        ).grid(row=4, column=2, sticky="w")
 
-        ttk.Label(frm, text="Process name").grid(row=4, column=2, sticky="w")
-        ttk.Entry(frm, textvariable=self.window_proc_var, width=22).grid(row=4, column=3, sticky="w")
+        ttk.Label(frm, text="Application").grid(row=5, column=0, sticky="w")
+        self.window_combo = ttk.Combobox(
+            frm,
+            textvariable=self.selected_window_var,
+            values=self.window_choices,
+            width=45,
+            state="readonly",
+        )
+        self.window_combo.grid(row=5, column=1, columnspan=2, sticky="we")
+        ttk.Button(frm, text="Refresh Apps", command=self.refresh_window_list).grid(row=5, column=3, sticky="we")
 
-        ttk.Button(frm, text="Start", command=self.start).grid(row=5, column=0, sticky="we")
-        ttk.Button(frm, text="Stop", command=self.stop).grid(row=5, column=1, sticky="we")
+        ttk.Button(frm, text="Start", command=self.start).grid(row=6, column=0, sticky="we")
+        ttk.Button(frm, text="Stop", command=self.stop).grid(row=6, column=1, sticky="we")
+        ttk.Button(frm, text="Clear Log", command=self.clear_log).grid(row=6, column=2, sticky="we")
         ttk.Button(frm, text="Capture Mouse Pos", command=self.capture_mouse).grid(
-            row=5, column=2, columnspan=2, sticky="we"
+            row=6, column=3, sticky="we"
         )
 
         ttk.Label(frm, textvariable=self.status_var, font=("Arial", 11, "bold")).grid(
-            row=6, column=0, columnspan=4, sticky="w"
+            row=7, column=0, columnspan=4, sticky="w"
         )
 
-        ttk.Label(frm, textvariable=self.rgb_var).grid(row=7, column=0, columnspan=4, sticky="w")
+        ttk.Label(frm, textvariable=self.rgb_var).grid(row=8, column=0, columnspan=4, sticky="w")
 
         self.log_box = scrolledtext.ScrolledText(frm, width=80, height=12, state="disabled")
-        self.log_box.grid(row=8, column=0, columnspan=4, pady=(8, 0), sticky="nsew")
+        self.log_box.grid(row=9, column=0, columnspan=4, pady=(8, 0), sticky="nsew")
+        self.log_box.configure(bg="#151515", fg="#e6e6e6", insertbackground="#e6e6e6")
 
         frm.columnconfigure(0, weight=1)
         frm.columnconfigure(1, weight=1)
         frm.columnconfigure(2, weight=1)
         frm.columnconfigure(3, weight=1)
-        frm.rowconfigure(8, weight=1)
+        frm.rowconfigure(9, weight=1)
 
     def log(self, message):
+        now = time.monotonic()
+        if message == self.last_log_message and now - self.last_log_time < 0.6:
+            return
+        self.last_log_message = message
+        self.last_log_time = now
+
         ts = time.strftime("%H:%M:%S")
         line = f"[{ts}] {message}\n"
         self.log_box.configure(state="normal")
         self.log_box.insert("end", line)
+        line_count = int(self.log_box.index("end-1c").split(".")[0])
+        if line_count > self.max_log_lines:
+            self.log_box.delete("1.0", f"{line_count - self.max_log_lines + 1}.0")
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
+
+    def clear_log(self):
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
+        self.log("Log cleared.")
 
     # -------------------------
     # Controls
@@ -206,24 +255,40 @@ class FishingBot:
     # Window targeting helpers
     # -------------------------
 
-    def _window_rect_for_process(self, process_name):
+    def _window_rect_for_hwnd(self, hwnd):
         if not WINDOWS_API_AVAILABLE:
             return None
 
-        process_name = process_name.strip().lower()
-        if not process_name:
+        if not hwnd:
             return None
 
-        found = {"rect": None}
+        rect = RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
 
+        w = rect.right - rect.left
+        h = rect.bottom - rect.top
+        if w <= 0 or h <= 0:
+            return None
+        return {"left": rect.left, "top": rect.top, "width": w, "height": h}
+
+    def _list_windows(self):
+        if not WINDOWS_API_AVAILABLE:
+            return []
+
+        windows = []
         enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
 
         def callback(hwnd, _lparam):
             if not user32.IsWindowVisible(hwnd):
                 return True
-
             length = user32.GetWindowTextLengthW(hwnd)
             if length == 0:
+                return True
+            title_buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, title_buffer, length + 1)
+            title = title_buffer.value.strip()
+            if not title:
                 return True
 
             pid = ctypes.c_ulong()
@@ -243,32 +308,33 @@ class FishingBot:
                     size.value,
                 ):
                     return True
-
-                exe_name = exe_name_buffer.value.lower()
-                if exe_name != process_name:
-                    return True
-
-                rect = RECT()
-                if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-                    return True
-
-                w = rect.right - rect.left
-                h = rect.bottom - rect.top
-                if w <= 0 or h <= 0:
-                    return True
-
-                found["rect"] = {
-                    "left": rect.left,
-                    "top": rect.top,
-                    "width": w,
-                    "height": h,
-                }
-                return False
+                exe_name = exe_name_buffer.value
+                windows.append((hwnd, f"{exe_name} | {title}"))
+                return True
             finally:
                 kernel32.CloseHandle(h_proc)
 
         user32.EnumWindows(enum_proc(callback), 0)
-        return found["rect"]
+        return windows
+
+    def refresh_window_list(self, log_refresh=True):
+        windows = self._list_windows()
+        self.window_choices = [f"[{int(hwnd)}] {label}" for hwnd, label in windows]
+        self.window_combo["values"] = self.window_choices
+        if self.window_choices and self.selected_window_var.get() not in self.window_choices:
+            self.selected_window_var.set(self.window_choices[0])
+        if log_refresh:
+            self.log(f"Application list refreshed ({len(self.window_choices)} windows).")
+
+    def _selected_hwnd(self):
+        selected = self.selected_window_var.get().strip()
+        if not selected.startswith("["):
+            return None
+        try:
+            end = selected.index("]")
+            return int(selected[1:end])
+        except (ValueError, IndexError):
+            return None
 
     def _resolve_capture_origin(self):
         x = self.x_var.get()
@@ -277,18 +343,16 @@ class FishingBot:
         if not self.use_window_var.get():
             return x, y
 
-        rect = self._window_rect_for_process(self.window_proc_var.get())
+        rect = self._window_rect_for_hwnd(self._selected_hwnd())
         if rect is None:
-            self.log(
-                f"Window target failed for '{self.window_proc_var.get()}'. Falling back to absolute screen coordinates."
-            )
+            now = time.monotonic()
+            if now - self.last_target_warning >= 3:
+                self.log("Window target unavailable. Falling back to absolute screen coordinates.")
+                self.last_target_warning = now
             return x, y
 
         target_x = rect["left"] + x
         target_y = rect["top"] + y
-        self.log(
-            f"Using {self.window_proc_var.get()} window @ ({rect['left']},{rect['top']},{rect['width']}x{rect['height']}); pixel=({target_x},{target_y})"
-        )
         return target_x, target_y
 
     # -------------------------
@@ -306,10 +370,26 @@ class FishingBot:
 
     def read_pixel(self, sct):
         x, y = self._resolve_capture_origin()
-        bbox = {"top": y, "left": x, "width": 1, "height": 1}
+        sample_radius = max(0, self.sample_radius_var.get())
+        sample_size = (sample_radius * 2) + 1
+        bbox = {
+            "top": y - sample_radius,
+            "left": x - sample_radius,
+            "width": sample_size,
+            "height": sample_size,
+        }
         shot = sct.grab(bbox)
-        pixel = shot.pixel(0, 0)
-        rgb = (pixel[2], pixel[1], pixel[0])
+        sum_r = 0
+        sum_g = 0
+        sum_b = 0
+        for sy in range(sample_size):
+            for sx in range(sample_size):
+                pixel = shot.pixel(sx, sy)
+                sum_b += pixel[0]
+                sum_g += pixel[1]
+                sum_r += pixel[2]
+        pixels = sample_size * sample_size
+        rgb = (sum_r // pixels, sum_g // pixels, sum_b // pixels)
 
         now = time.monotonic()
         if now - self.last_rgb_update >= 0.1:  # throttle UI updates for speed
