@@ -176,19 +176,37 @@ class GameStateSampler:
       - simple boolean flags
     """
 
-    def __init__(self, x: int, y: int, change_threshold: int = 20):
+    def __init__(
+        self,
+        x: int,
+        y: int,
+        change_threshold: int = 20,
+        blue_follow_window: float = 1.5,
+    ):
         self.x = x
         self.y = y
         self.change_threshold = change_threshold
+        self.blue_follow_window = blue_follow_window
 
         self.initialized = False
         self.last_rgb = (0, 0, 0)
         self.last_change_time = time.time()
         self.last_sample_time = time.time()
+        self.last_green_time = 0.0
+        self.waiting_for_blue_after_green = False
 
     def set_point(self, x: int, y: int) -> None:
         self.x = x
         self.y = y
+
+    def reset(self) -> None:
+        self.initialized = False
+        self.last_rgb = (0, 0, 0)
+        now = time.time()
+        self.last_change_time = now
+        self.last_sample_time = now
+        self.last_green_time = 0.0
+        self.waiting_for_blue_after_green = False
 
     def _read_pixel(self, sct: mss.mss) -> tuple[int, int, int]:
         shot = sct.grab({"left": self.x, "top": self.y, "width": 1, "height": 1})
@@ -216,6 +234,22 @@ class GameStateSampler:
 
         bright_flag = 1.0 if (r + g + b) > 420 else 0.0
         green_dominant_flag = 1.0 if g > (r + 8) and g > (b + 8) else 0.0
+        blue_dominant_flag = 1.0 if b > (r + 8) and b > (g + 8) else 0.0
+
+        if green_dominant_flag:
+            self.last_green_time = now
+            self.waiting_for_blue_after_green = True
+
+        if self.waiting_for_blue_after_green and (now - self.last_green_time) > self.blue_follow_window:
+            self.waiting_for_blue_after_green = False
+
+        blue_after_green_flag = (
+            1.0
+            if self.waiting_for_blue_after_green and blue_dominant_flag and not green_dominant_flag
+            else 0.0
+        )
+        if blue_after_green_flag:
+            self.waiting_for_blue_after_green = False
 
         features = [
             r / 255.0,
@@ -226,6 +260,8 @@ class GameStateSampler:
             elapsed_since_sample,
             bright_flag,
             green_dominant_flag,
+            blue_dominant_flag,
+            blue_after_green_flag,
         ]
 
         state_info = {
@@ -234,6 +270,8 @@ class GameStateSampler:
             "b": b,
             "delta": delta,
             "green_flag": bool(green_dominant_flag),
+            "blue_flag": bool(blue_dominant_flag),
+            "blue_after_green_flag": bool(blue_after_green_flag),
             "bright_flag": bool(bright_flag),
         }
 
@@ -275,7 +313,7 @@ class AppGUI:
 
         self.sampler = GameStateSampler(self.pixel_x_var.get(), self.pixel_y_var.get())
         self.last_hold_ratio = 0.0
-        self.learner = OnlineLearner(num_features=9, learning_rate=self.learning_rate_var.get())
+        self.learner = OnlineLearner(num_features=11, learning_rate=self.learning_rate_var.get())
 
         self._build_layout()
         self._load_existing_state()
@@ -404,6 +442,7 @@ class AppGUI:
             return
 
         self.sampler.set_point(self.pixel_x_var.get(), self.pixel_y_var.get())
+        self.sampler.reset()
         self.learner.learning_rate = float(self.learning_rate_var.get())
 
         self.running = True
@@ -425,6 +464,7 @@ class AppGUI:
             return
 
         self.sampler.set_point(self.pixel_x_var.get(), self.pixel_y_var.get())
+        self.sampler.reset()
         self.running = True
         self.mode = "inference"
         self.status_var.set("Use model running")
@@ -452,7 +492,7 @@ class AppGUI:
             return
 
         self.last_hold_ratio = 0.0
-        self.learner = OnlineLearner(num_features=9, learning_rate=float(self.learning_rate_var.get()))
+        self.learner = OnlineLearner(num_features=11, learning_rate=float(self.learning_rate_var.get()))
         self.stats = TrainingStats()
         self._refresh_stats_labels()
         self.save_model()
@@ -496,6 +536,8 @@ class AppGUI:
 
                     threshold = float(self.threshold_var.get())
                     prediction, prob_press = self.learner.predict(features, threshold)
+                    if prediction == 1 and not state_info["blue_after_green_flag"]:
+                        prediction = 0
                     confidence = max(prob_press, 1.0 - prob_press)
                     predicted_text = "PRESS E NOW" if prediction == 1 else "DO NOT PRESS E"
 
@@ -526,7 +568,11 @@ class AppGUI:
                     state_name = (
                         "green circle-like state"
                         if state_info["green_flag"]
-                        else "non-green state"
+                        else "blue-after-green trigger state"
+                        if state_info["blue_after_green_flag"]
+                        else "blue state"
+                        if state_info["blue_flag"]
+                        else "non-green/non-blue state"
                     )
                     self.logger.log(
                         f"Detected {state_name}, rgb=({state_info['r']},{state_info['g']},{state_info['b']}), "
@@ -575,6 +621,8 @@ class AppGUI:
                     features.append(self.last_hold_ratio)
                     threshold = float(self.threshold_var.get())
                     prediction, prob_press = self.learner.predict(features, threshold)
+                    if prediction == 1 and not state_info["blue_after_green_flag"]:
+                        prediction = 0
                     confidence = max(prob_press, 1.0 - prob_press)
 
                     if prediction == 1:
