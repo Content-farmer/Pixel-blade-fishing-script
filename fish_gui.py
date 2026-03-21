@@ -22,6 +22,7 @@ class TrainingStats:
     reinforcement_count: int = 0
     penalty_count: int = 0
     total_hold_seconds: float = 0.0
+    timeout_forced_casts: int = 0
 
 
 class Logger:
@@ -353,11 +354,17 @@ class AppGUI:
         self.incorrect_var = tk.StringVar(value="Incorrect predictions: 0")
         self.reinforce_var = tk.StringVar(value="Reinforcement count: 0")
         self.penalty_var = tk.StringVar(value="Penalty count: 0")
+        self.total_hold_var = tk.StringVar(value="Total E hold seconds: 0.000")
+        self.timeout_cast_var = tk.StringVar(value="Timeout forced casts: 0")
 
         self.sampler = GameStateSampler()
         self.last_hold_ratio = 0.0
         self.e_press_burst_count = 10
         self.learner = OnlineLearner(num_features=11, learning_rate=self.learning_rate_var.get())
+        self.cast_timeout_seconds = 15.0
+        self.cast_active = False
+        self.cast_started_at = 0.0
+        self.cast_action_happened = False
 
         self._build_layout()
         self._load_existing_state()
@@ -401,6 +408,8 @@ class AppGUI:
         ttk.Label(stats, textvariable=self.incorrect_var).pack(anchor="w", padx=8)
         ttk.Label(stats, textvariable=self.reinforce_var).pack(anchor="w", padx=8)
         ttk.Label(stats, textvariable=self.penalty_var).pack(anchor="w", padx=8)
+        ttk.Label(stats, textvariable=self.total_hold_var).pack(anchor="w", padx=8)
+        ttk.Label(stats, textvariable=self.timeout_cast_var).pack(anchor="w", padx=8)
 
         logs = ttk.LabelFrame(self.root, text="Live Log")
         logs.pack(fill="both", expand=True, padx=10, pady=8)
@@ -415,10 +424,14 @@ class AppGUI:
         ttk.Label(self.root, text=note, justify="left").pack(fill="x", padx=10, pady=4)
 
     def _append_log_to_gui(self, line: str) -> None:
-        self.log_text.configure(state=tk.NORMAL)
-        self.log_text.insert(tk.END, line + "\n")
-        self.log_text.see(tk.END)
-        self.log_text.configure(state=tk.DISABLED)
+        try:
+            self.log_text.configure(state=tk.NORMAL)
+            self.log_text.insert(tk.END, line + "\n")
+            self.log_text.see(tk.END)
+            self.log_text.configure(state=tk.DISABLED)
+        except tk.TclError:
+            # UI logging failures should not crash the app.
+            pass
 
     def _pump_log_queue(self) -> None:
         try:
@@ -435,6 +448,8 @@ class AppGUI:
         self.incorrect_var.set(f"Incorrect predictions: {self.stats.incorrect_predictions}")
         self.reinforce_var.set(f"Reinforcement count: {self.stats.reinforcement_count}")
         self.penalty_var.set(f"Penalty count: {self.stats.penalty_count}")
+        self.total_hold_var.set(f"Total E hold seconds: {self.stats.total_hold_seconds:.3f}")
+        self.timeout_cast_var.set(f"Timeout forced casts: {self.stats.timeout_forced_casts}")
 
     def _load_existing_state(self) -> None:
         state = self.storage.load()
@@ -448,6 +463,7 @@ class AppGUI:
             reinforcement_count=int(stats_blob.get("reinforcement_count", 0)),
             penalty_count=int(stats_blob.get("penalty_count", 0)),
             total_hold_seconds=float(stats_blob.get("total_hold_seconds", 0.0)),
+            timeout_forced_casts=int(stats_blob.get("timeout_forced_casts", 0)),
         )
         self._refresh_stats_labels()
 
@@ -483,6 +499,9 @@ class AppGUI:
 
         self.sampler.reset()
         self.learner.learning_rate = float(self.learning_rate_var.get())
+        self.cast_active = False
+        self.cast_started_at = 0.0
+        self.cast_action_happened = False
 
         self.running = True
         self.mode = "training"
@@ -503,6 +522,9 @@ class AppGUI:
             return
 
         self.sampler.reset()
+        self.cast_active = False
+        self.cast_started_at = 0.0
+        self.cast_action_happened = False
         self.running = True
         self.mode = "inference"
         self.status_var.set("Use model running")
@@ -538,6 +560,25 @@ class AppGUI:
         self.confidence_var.set("Confidence: 0.00")
         self.logger.log("Model and training statistics were reset.")
 
+    def _update_cast_timeout_state(self, state_info: dict) -> None:
+        now = time.time()
+        if state_info["green_flag"] and not self.cast_active:
+            self.cast_active = True
+            self.cast_started_at = now
+            self.cast_action_happened = False
+            self.logger.log("Detected cast state entry (green trigger).")
+
+        if self.cast_active and state_info["blue_after_green_flag"]:
+            self.cast_active = False
+            self.cast_started_at = 0.0
+            self.cast_action_happened = False
+            self.logger.log("Detected post-cast blue trigger; cast cycle complete.")
+
+    def _timeout_should_force_cast(self) -> bool:
+        if not self.cast_active or self.cast_action_happened:
+            return False
+        return (time.time() - self.cast_started_at) >= self.cast_timeout_seconds
+
     def _observe_player_response(self, response_window: float) -> tuple[int, float]:
         """
         Observe whether player presses E during a short response window and for how long.
@@ -569,8 +610,14 @@ class AppGUI:
         try:
             with mss.mss() as sct:
                 while self.running:
-                    features, state_info = self.sampler.sample(sct)
+                    try:
+                        features, state_info = self.sampler.sample(sct)
+                    except Exception as exc:
+                        self.logger.log(f"Screen sampling error (training): {exc}")
+                        time.sleep(0.1)
+                        continue
                     features.append(self.last_hold_ratio)
+                    self._update_cast_timeout_state(state_info)
 
                     threshold = float(self.threshold_var.get())
                     prediction, prob_press = self.learner.predict(features, threshold)
@@ -582,6 +629,8 @@ class AppGUI:
                     response_window = float(self.response_window_var.get())
                     player_pressed, hold_seconds = self._observe_player_response(response_window)
                     hold_ratio = hold_seconds / response_window if response_window > 0 else 0.0
+                    if player_pressed:
+                        self.cast_action_happened = True
 
                     matched, reinforcement_label = self.learner.update(
                         features,
@@ -590,6 +639,35 @@ class AppGUI:
                         hold_ratio=hold_ratio,
                     )
                     self.last_hold_ratio = hold_ratio
+
+                    if self._timeout_should_force_cast():
+                        for _ in range(self.e_press_burst_count):
+                            keyboard.press_and_release("e")
+                            time.sleep(0.01)
+
+                        forced_label = 1
+                        forced_hold_ratio = 1.0
+                        forced_matched, forced_feedback = self.learner.update(
+                            features,
+                            forced_label,
+                            prediction,
+                            hold_ratio=forced_hold_ratio,
+                        )
+                        self.cast_action_happened = True
+                        self.cast_active = False
+                        self.cast_started_at = 0.0
+                        self.stats.timeout_forced_casts += 1
+                        self.stats.total_samples += 1
+                        if forced_matched:
+                            self.stats.correct_predictions += 1
+                            self.stats.reinforcement_count += 1
+                        else:
+                            self.stats.incorrect_predictions += 1
+                            self.stats.penalty_count += 1
+                        self.logger.log(
+                            "No action for 15s after cast; forced E cast and applied "
+                            f"{forced_feedback} (hold_ratio=1.00)."
+                        )
 
                     self.stats.total_samples += 1
                     self.stats.total_hold_seconds += hold_seconds
@@ -657,8 +735,14 @@ class AppGUI:
 
             with mss.mss() as sct:
                 while self.running:
-                    features, state_info = self.sampler.sample(sct)
+                    try:
+                        features, state_info = self.sampler.sample(sct)
+                    except Exception as exc:
+                        self.logger.log(f"Screen sampling error (inference): {exc}")
+                        time.sleep(0.1)
+                        continue
                     features.append(self.last_hold_ratio)
+                    self._update_cast_timeout_state(state_info)
                     threshold = float(self.threshold_var.get())
                     prediction, prob_press = self.learner.predict(features, threshold)
                     if prediction == 1 and not state_info["blue_after_green_flag"]:
@@ -686,6 +770,16 @@ class AppGUI:
                             0,
                             lambda c=confidence: self.confidence_var.set(f"Confidence: {c:.2f}"),
                         )
+                        self.cast_action_happened = True
+
+                    if self._timeout_should_force_cast():
+                        for _ in range(self.e_press_burst_count):
+                            keyboard.press_and_release("e")
+                            time.sleep(0.01)
+                        self.cast_action_happened = True
+                        self.cast_active = False
+                        self.cast_started_at = 0.0
+                        self.logger.log("Use model timeout: no action for 15s after cast; forced E cast.")
 
                     time.sleep(float(self.sample_interval_var.get()))
         except Exception as exc:
