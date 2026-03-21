@@ -182,11 +182,17 @@ class GameStateSampler:
         y: int,
         change_threshold: int = 20,
         blue_follow_window: float = 1.5,
+        color_tolerance: int = 20,
     ):
         self.x = x
         self.y = y
         self.change_threshold = change_threshold
         self.blue_follow_window = blue_follow_window
+        self.color_tolerance = color_tolerance
+        self.green_trigger_colors = (
+            (39, 162, 71),
+            (195, 223, 224),
+        )
 
         self.initialized = False
         self.last_rgb = (0, 0, 0)
@@ -213,6 +219,16 @@ class GameStateSampler:
         b, g, r, _ = shot.raw[0:4]
         return r, g, b
 
+    def _is_close_to_trigger_green(self, r: int, g: int, b: int) -> bool:
+        for tr, tg, tb in self.green_trigger_colors:
+            if (
+                abs(r - tr) <= self.color_tolerance
+                and abs(g - tg) <= self.color_tolerance
+                and abs(b - tb) <= self.color_tolerance
+            ):
+                return True
+        return False
+
     def sample(self, sct: mss.mss) -> tuple[list[float], dict]:
         now = time.time()
         r, g, b = self._read_pixel(sct)
@@ -233,7 +249,7 @@ class GameStateSampler:
         elapsed_since_sample = min(1.0, now - self.last_sample_time)
 
         bright_flag = 1.0 if (r + g + b) > 420 else 0.0
-        green_dominant_flag = 1.0 if g > (r + 8) and g > (b + 8) else 0.0
+        green_dominant_flag = 1.0 if self._is_close_to_trigger_green(r, g, b) else 0.0
         blue_dominant_flag = 1.0 if b > (r + 8) and b > (g + 8) else 0.0
 
         if green_dominant_flag:
@@ -313,6 +329,7 @@ class AppGUI:
 
         self.sampler = GameStateSampler(self.pixel_x_var.get(), self.pixel_y_var.get())
         self.last_hold_ratio = 0.0
+        self.e_press_burst_count = 10
         self.learner = OnlineLearner(num_features=11, learning_rate=self.learning_rate_var.get())
 
         self._build_layout()
@@ -626,25 +643,25 @@ class AppGUI:
                     confidence = max(prob_press, 1.0 - prob_press)
 
                     if prediction == 1:
-                        keyboard.press_and_release("e")
-                        action_text = "pressed E"
-                    else:
-                        action_text = "did not press E"
+                        for _ in range(self.e_press_burst_count):
+                            keyboard.press_and_release("e")
+                            time.sleep(0.01)
 
-                    predicted_text = "PRESS E NOW" if prediction == 1 else "DO NOT PRESS E"
-                    self.logger.log(
-                        f"Use model detected rgb=({state_info['r']},{state_info['g']},{state_info['b']}), "
-                        f"delta={state_info['delta']}, confidence {confidence:.2f}, prediction {predicted_text}; {action_text}."
-                    )
+                        predicted_text = "PRESS E NOW"
+                        self.logger.log(
+                            f"Use model detected rgb=({state_info['r']},{state_info['g']},{state_info['b']}), "
+                            f"delta={state_info['delta']}, confidence {confidence:.2f}, prediction {predicted_text}; "
+                            f"pressed E {self.e_press_burst_count} times."
+                        )
 
-                    self.root.after(
-                        0,
-                        lambda p=predicted_text: self.prediction_var.set(f"Prediction: {p}"),
-                    )
-                    self.root.after(
-                        0,
-                        lambda c=confidence: self.confidence_var.set(f"Confidence: {c:.2f}"),
-                    )
+                        self.root.after(
+                            0,
+                            lambda p=predicted_text: self.prediction_var.set(f"Prediction: {p}"),
+                        )
+                        self.root.after(
+                            0,
+                            lambda c=confidence: self.confidence_var.set(f"Confidence: {c:.2f}"),
+                        )
 
                     time.sleep(float(self.sample_interval_var.get()))
         except Exception as exc:
