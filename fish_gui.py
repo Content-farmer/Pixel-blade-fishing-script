@@ -170,7 +170,7 @@ class OnlineLearner:
 class GameStateSampler:
     """
     Lightweight state extraction only (no heavy CV/OCR):
-      - single pixel color (R,G,B)
+      - whole-screen sampled average color (R,G,B)
       - color-change magnitude
       - timing since last notable color change
       - simple boolean flags
@@ -178,14 +178,10 @@ class GameStateSampler:
 
     def __init__(
         self,
-        x: int,
-        y: int,
         change_threshold: int = 20,
         blue_follow_window: float = 1.5,
         color_tolerance: int = 20,
     ):
-        self.x = x
-        self.y = y
         self.change_threshold = change_threshold
         self.blue_follow_window = blue_follow_window
         self.color_tolerance = color_tolerance
@@ -201,10 +197,6 @@ class GameStateSampler:
         self.last_green_time = 0.0
         self.waiting_for_blue_after_green = False
 
-    def set_point(self, x: int, y: int) -> None:
-        self.x = x
-        self.y = y
-
     def reset(self) -> None:
         self.initialized = False
         self.last_rgb = (0, 0, 0)
@@ -214,10 +206,45 @@ class GameStateSampler:
         self.last_green_time = 0.0
         self.waiting_for_blue_after_green = False
 
-    def _read_pixel(self, sct: mss.mss) -> tuple[int, int, int]:
-        shot = sct.grab({"left": self.x, "top": self.y, "width": 1, "height": 1})
-        b, g, r, _ = shot.raw[0:4]
-        return r, g, b
+    def _read_screen_state(self, sct: mss.mss) -> tuple[int, int, int, float, float]:
+        monitor = sct.monitors[1]
+        shot = sct.grab(monitor)
+        raw = memoryview(shot.raw)
+        total_pixels = shot.width * shot.height
+        sample_cap = 4000
+        stride_pixels = max(1, total_pixels // sample_cap)
+        stride_bytes = stride_pixels * 4
+
+        sampled = 0
+        sum_r = 0
+        sum_g = 0
+        sum_b = 0
+        green_hits = 0
+        blue_hits = 0
+
+        for i in range(0, len(raw), stride_bytes):
+            b = raw[i]
+            g = raw[i + 1]
+            r = raw[i + 2]
+            sum_r += r
+            sum_g += g
+            sum_b += b
+            sampled += 1
+
+            if self._is_close_to_trigger_green(r, g, b):
+                green_hits += 1
+            if b > (r + 8) and b > (g + 8):
+                blue_hits += 1
+
+        if sampled == 0:
+            return 0, 0, 0, 0.0, 0.0
+
+        avg_r = int(sum_r / sampled)
+        avg_g = int(sum_g / sampled)
+        avg_b = int(sum_b / sampled)
+        green_ratio = green_hits / sampled
+        blue_ratio = blue_hits / sampled
+        return avg_r, avg_g, avg_b, green_ratio, blue_ratio
 
     def _is_close_to_trigger_green(self, r: int, g: int, b: int) -> bool:
         for tr, tg, tb in self.green_trigger_colors:
@@ -231,7 +258,7 @@ class GameStateSampler:
 
     def sample(self, sct: mss.mss) -> tuple[list[float], dict]:
         now = time.time()
-        r, g, b = self._read_pixel(sct)
+        r, g, b, green_ratio, blue_ratio = self._read_screen_state(sct)
 
         if not self.initialized:
             self.last_rgb = (r, g, b)
@@ -249,8 +276,8 @@ class GameStateSampler:
         elapsed_since_sample = min(1.0, now - self.last_sample_time)
 
         bright_flag = 1.0 if (r + g + b) > 420 else 0.0
-        green_dominant_flag = 1.0 if self._is_close_to_trigger_green(r, g, b) else 0.0
-        blue_dominant_flag = 1.0 if b > (r + 8) and b > (g + 8) else 0.0
+        green_dominant_flag = 1.0 if green_ratio >= 0.003 else 0.0
+        blue_dominant_flag = 1.0 if blue_ratio >= 0.01 else 0.0
 
         if green_dominant_flag:
             self.last_green_time = now
@@ -285,6 +312,8 @@ class GameStateSampler:
             "g": g,
             "b": b,
             "delta": delta,
+            "green_ratio": green_ratio,
+            "blue_ratio": blue_ratio,
             "green_flag": bool(green_dominant_flag),
             "blue_flag": bool(blue_dominant_flag),
             "blue_after_green_flag": bool(blue_after_green_flag),
@@ -314,8 +343,6 @@ class AppGUI:
         self.response_window_var = tk.DoubleVar(value=0.20)
         self.threshold_var = tk.DoubleVar(value=0.50)
         self.learning_rate_var = tk.DoubleVar(value=0.08)
-        self.pixel_x_var = tk.IntVar(value=960)
-        self.pixel_y_var = tk.IntVar(value=540)
 
         self.status_var = tk.StringVar(value="Idle")
         self.prediction_var = tk.StringVar(value="Prediction: waiting")
@@ -327,7 +354,7 @@ class AppGUI:
         self.reinforce_var = tk.StringVar(value="Reinforcement count: 0")
         self.penalty_var = tk.StringVar(value="Penalty count: 0")
 
-        self.sampler = GameStateSampler(self.pixel_x_var.get(), self.pixel_y_var.get())
+        self.sampler = GameStateSampler()
         self.last_hold_ratio = 0.0
         self.e_press_burst_count = 10
         self.learner = OnlineLearner(num_features=11, learning_rate=self.learning_rate_var.get())
@@ -343,20 +370,15 @@ class AppGUI:
         config.pack(fill="x", padx=10, pady=8)
 
         pad = {"padx": 6, "pady": 4}
-        ttk.Label(config, text="Pixel X").grid(row=0, column=0, **pad)
-        ttk.Entry(config, textvariable=self.pixel_x_var, width=8).grid(row=0, column=1, **pad)
-        ttk.Label(config, text="Pixel Y").grid(row=0, column=2, **pad)
-        ttk.Entry(config, textvariable=self.pixel_y_var, width=8).grid(row=0, column=3, **pad)
+        ttk.Label(config, text="Sample interval (s)").grid(row=0, column=0, **pad)
+        ttk.Entry(config, textvariable=self.sample_interval_var, width=8).grid(row=0, column=1, **pad)
+        ttk.Label(config, text="Response window (s)").grid(row=0, column=2, **pad)
+        ttk.Entry(config, textvariable=self.response_window_var, width=8).grid(row=0, column=3, **pad)
 
-        ttk.Label(config, text="Sample interval (s)").grid(row=1, column=0, **pad)
-        ttk.Entry(config, textvariable=self.sample_interval_var, width=8).grid(row=1, column=1, **pad)
-        ttk.Label(config, text="Response window (s)").grid(row=1, column=2, **pad)
-        ttk.Entry(config, textvariable=self.response_window_var, width=8).grid(row=1, column=3, **pad)
-
-        ttk.Label(config, text="Decision threshold").grid(row=2, column=0, **pad)
-        ttk.Entry(config, textvariable=self.threshold_var, width=8).grid(row=2, column=1, **pad)
-        ttk.Label(config, text="Learning rate").grid(row=2, column=2, **pad)
-        ttk.Entry(config, textvariable=self.learning_rate_var, width=8).grid(row=2, column=3, **pad)
+        ttk.Label(config, text="Decision threshold").grid(row=1, column=0, **pad)
+        ttk.Entry(config, textvariable=self.threshold_var, width=8).grid(row=1, column=1, **pad)
+        ttk.Label(config, text="Learning rate").grid(row=1, column=2, **pad)
+        ttk.Entry(config, textvariable=self.learning_rate_var, width=8).grid(row=1, column=3, **pad)
 
         controls = ttk.Frame(self.root)
         controls.pack(fill="x", padx=10, pady=5)
@@ -387,7 +409,8 @@ class AppGUI:
 
         note = (
             "Start Training: learns from your E key behavior.\n"
-            "Use Model: waits 2 seconds so you can switch screens, then presses E automatically when predicted."
+            "Use Model: waits 2 seconds so you can switch screens, then presses E automatically when predicted.\n"
+            "Screen analysis now uses the whole primary display (not a single pixel)."
         )
         ttk.Label(self.root, text=note, justify="left").pack(fill="x", padx=10, pady=4)
 
@@ -458,7 +481,6 @@ class AppGUI:
             messagebox.showerror("Invalid settings", str(exc))
             return
 
-        self.sampler.set_point(self.pixel_x_var.get(), self.pixel_y_var.get())
         self.sampler.reset()
         self.learner.learning_rate = float(self.learning_rate_var.get())
 
@@ -480,7 +502,6 @@ class AppGUI:
             messagebox.showerror("Invalid settings", str(exc))
             return
 
-        self.sampler.set_point(self.pixel_x_var.get(), self.pixel_y_var.get())
         self.sampler.reset()
         self.running = True
         self.mode = "inference"
@@ -593,7 +614,9 @@ class AppGUI:
                     )
                     self.logger.log(
                         f"Detected {state_name}, rgb=({state_info['r']},{state_info['g']},{state_info['b']}), "
-                        f"delta={state_info['delta']}, confidence {confidence:.2f}, predicted {predicted_text}."
+                        f"delta={state_info['delta']}, green_ratio={state_info['green_ratio']:.4f}, "
+                        f"blue_ratio={state_info['blue_ratio']:.4f}, confidence {confidence:.2f}, "
+                        f"predicted {predicted_text}."
                     )
                     self.logger.log(
                         f"Player {player_text}, prediction {correctness_text}, applying {reinforcement_label}."
@@ -650,8 +673,9 @@ class AppGUI:
                         predicted_text = "PRESS E NOW"
                         self.logger.log(
                             f"Use model detected rgb=({state_info['r']},{state_info['g']},{state_info['b']}), "
-                            f"delta={state_info['delta']}, confidence {confidence:.2f}, prediction {predicted_text}; "
-                            f"pressed E {self.e_press_burst_count} times."
+                            f"delta={state_info['delta']}, green_ratio={state_info['green_ratio']:.4f}, "
+                            f"blue_ratio={state_info['blue_ratio']:.4f}, confidence {confidence:.2f}, "
+                            f"prediction {predicted_text}; pressed E {self.e_press_burst_count} times."
                         )
 
                         self.root.after(
