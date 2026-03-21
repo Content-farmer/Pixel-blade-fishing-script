@@ -28,6 +28,10 @@ class ColorWatcherApp:
         self.blue_var = tk.StringVar(value="195,223,224")
 
         self.tolerance_var = tk.IntVar(value=20)
+        self.cast_hold_var = tk.DoubleVar(value=1.0)
+        self.green_hold_var = tk.DoubleVar(value=1.5)
+        self.tap_count_var = tk.IntVar(value=10)
+        self.tap_interval_var = tk.DoubleVar(value=0.30)
         self.status_var = tk.StringVar(value="Idle")
 
         self.build_ui()
@@ -66,6 +70,21 @@ class ColorWatcherApp:
         ttk.Label(colors, text="Tolerance").grid(row=2, column=0, **pad)
         ttk.Entry(colors, textvariable=self.tolerance_var, width=8).grid(row=2, column=1, sticky="w", padx=8, pady=6)
 
+        timings = ttk.LabelFrame(self.root, text="Sequence Timings")
+        timings.pack(fill="x", padx=10, pady=4)
+
+        ttk.Label(timings, text="Cast hold (s)").grid(row=0, column=0, **pad)
+        ttk.Entry(timings, textvariable=self.cast_hold_var, width=8).grid(row=0, column=1, **pad)
+
+        ttk.Label(timings, text="Green hold (s)").grid(row=0, column=2, **pad)
+        ttk.Entry(timings, textvariable=self.green_hold_var, width=8).grid(row=0, column=3, **pad)
+
+        ttk.Label(timings, text="Blue taps").grid(row=1, column=0, **pad)
+        ttk.Entry(timings, textvariable=self.tap_count_var, width=8).grid(row=1, column=1, **pad)
+
+        ttk.Label(timings, text="Tap interval (s)").grid(row=1, column=2, **pad)
+        ttk.Entry(timings, textvariable=self.tap_interval_var, width=8).grid(row=1, column=3, **pad)
+
         controls = ttk.Frame(self.root)
         controls.pack(fill="x", padx=10, pady=12)
 
@@ -75,9 +94,11 @@ class ColorWatcherApp:
         ttk.Label(self.root, textvariable=self.status_var, anchor="w").pack(fill="x", padx=12, pady=8)
 
         help_text = (
-            "This template watches a small screen region for target colors and\n"
-            "runs a local demo sequence when found. Replace demo_action_* with\n"
-            "your own non-game workflow."
+            "Fishing loop:\n"
+            "1) Hold E to cast, release.\n"
+            "2) When green circle appears, hold E and release.\n"
+            "3) When blue center appears, tap E repeatedly.\n"
+            "Use F6 to start and F7 to stop."
         )
         ttk.Label(self.root, text=help_text, justify="left").pack(fill="x", padx=12, pady=6)
 
@@ -105,25 +126,51 @@ class ColorWatcherApp:
                 return True
         return False
 
-    def demo_action_green(self):
-        self.set_status("Green detected -> running demo sequence")
-        keyboard.press("e")
-        time.sleep(0.15)
-        keyboard.release("e")
+    def hold_key(self, key, duration):
+        keyboard.press(key)
+        end_time = time.time() + duration
+        while self.running and time.time() < end_time:
+            time.sleep(0.01)
+        keyboard.release(key)
 
-    def demo_action_blue(self):
-        self.set_status("Blue detected -> running interval demo")
-        for _ in range(10):
-            keyboard.press("e")
+    def tap_key(self, key, count, interval):
+        for _ in range(count):
+            if not self.running:
+                return
+            keyboard.press(key)
             time.sleep(0.03)
-            keyboard.release("e")
-            time.sleep(0.30)
+            keyboard.release(key)
+            time.sleep(interval)
+
+    def action_cast(self, cast_hold):
+        self.set_status("Casting rod (holding E)")
+        self.hold_key("e", cast_hold)
+
+    def action_green(self, green_hold):
+        self.set_status("Green circle detected -> hold E")
+        self.hold_key("e", green_hold)
+
+    def action_blue(self, tap_count, tap_interval):
+        self.set_status("Blue circle detected -> tapping E")
+        self.tap_key("e", tap_count, tap_interval)
+
+    def wait_until_color_clears(self, sct, region, target, tolerance, max_wait=1.0):
+        start_time = time.time()
+        while self.running and (time.time() - start_time) < max_wait:
+            if not self.region_contains_color(sct, region, target, tolerance):
+                return True
+            time.sleep(0.02)
+        return False
 
     def worker_loop(self):
         try:
             green = self.parse_rgb(self.green_var.get())
             blue = self.parse_rgb(self.blue_var.get())
             tolerance = self.tolerance_var.get()
+            cast_hold = float(self.cast_hold_var.get())
+            green_hold = float(self.green_hold_var.get())
+            tap_count = int(self.tap_count_var.get())
+            tap_interval = float(self.tap_interval_var.get())
 
             region = {
                 "left": self.x_var.get(),
@@ -133,22 +180,24 @@ class ColorWatcherApp:
             }
 
             with mss.mss() as sct:
-                self.set_status("Watching region...")
-                green_cooldown = 0.0
-                blue_cooldown = 0.0
-
                 while self.running:
-                    now = time.time()
+                    self.action_cast(cast_hold)
+                    if not self.running:
+                        break
 
-                    if now >= green_cooldown and self.region_contains_color(sct, region, green, tolerance):
-                        self.demo_action_green()
-                        green_cooldown = now + 1.0
+                    # Run green chain until blue center appears.
+                    while self.running:
+                        if self.region_contains_color(sct, region, blue, tolerance):
+                            self.action_blue(tap_count, tap_interval)
+                            self.wait_until_color_clears(sct, region, blue, tolerance, max_wait=2.0)
+                            break
 
-                    elif now >= blue_cooldown and self.region_contains_color(sct, region, blue, tolerance):
-                        self.demo_action_blue()
-                        blue_cooldown = now + 2.5
+                        if self.region_contains_color(sct, region, green, tolerance):
+                            self.action_green(green_hold)
+                            self.wait_until_color_clears(sct, region, green, tolerance, max_wait=1.0)
+                            continue
 
-                    time.sleep(0.03)
+                        time.sleep(0.02)
 
         except Exception as e:
             self.set_status(f"Error: {e}")
