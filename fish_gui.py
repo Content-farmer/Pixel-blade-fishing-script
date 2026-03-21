@@ -242,6 +242,7 @@ class AppGUI:
         self.stats = TrainingStats()
 
         self.running = False
+        self.mode = "idle"
         self.worker_thread: threading.Thread | None = None
 
         self.sample_interval_var = tk.DoubleVar(value=0.10)
@@ -293,6 +294,7 @@ class AppGUI:
         controls = ttk.Frame(self.root)
         controls.pack(fill="x", padx=10, pady=5)
         ttk.Button(controls, text="Start Training", command=self.start_training).pack(side="left", padx=5)
+        ttk.Button(controls, text="Use Model", command=self.start_use_model).pack(side="left", padx=5)
         ttk.Button(controls, text="Stop", command=self.stop_training).pack(side="left", padx=5)
         ttk.Button(controls, text="Save Model Now", command=self.save_model).pack(side="left", padx=5)
         ttk.Button(controls, text="Reset Model", command=self.reset_model).pack(side="left", padx=5)
@@ -317,8 +319,8 @@ class AppGUI:
         self.log_text.pack(fill="both", expand=True, padx=6, pady=6)
 
         note = (
-            "This app only observes and recommends; it never presses E automatically.\n"
-            "The model learns online from whether your real E behavior matches its prediction."
+            "Start Training: learns from your E key behavior.\n"
+            "Use Model: waits 2 seconds so you can switch screens, then presses E automatically when predicted."
         )
         ttk.Label(self.root, text=note, justify="left").pack(fill="x", padx=10, pady=4)
 
@@ -392,19 +394,40 @@ class AppGUI:
         self.learner.learning_rate = float(self.learning_rate_var.get())
 
         self.running = True
+        self.mode = "training"
         self.status_var.set("Training running")
         self.logger.log("Training started.")
 
         self.worker_thread = threading.Thread(target=self._training_loop, daemon=True)
         self.worker_thread.start()
 
+    def start_use_model(self) -> None:
+        if self.running:
+            return
+
+        try:
+            self._validate_settings()
+        except Exception as exc:
+            messagebox.showerror("Invalid settings", str(exc))
+            return
+
+        self.sampler.set_point(self.pixel_x_var.get(), self.pixel_y_var.get())
+        self.running = True
+        self.mode = "inference"
+        self.status_var.set("Use model running")
+        self.logger.log("Use model selected. Waiting 2 seconds so you can switch screens...")
+
+        self.worker_thread = threading.Thread(target=self._inference_loop, daemon=True)
+        self.worker_thread.start()
+
     def stop_training(self) -> None:
         if not self.running:
             return
         self.running = False
+        self.mode = "idle"
         self.status_var.set("Stopped")
         self.save_model()
-        self.logger.log("Training stopped.")
+        self.logger.log("Worker stopped.")
 
     def save_model(self) -> None:
         self.storage.save(self.learner.to_dict(), self.stats)
@@ -497,6 +520,51 @@ class AppGUI:
             self.logger.log(f"Training loop error: {exc}")
         finally:
             self.save_model()
+
+    def _inference_loop(self) -> None:
+        try:
+            time.sleep(2.0)
+            if not self.running:
+                return
+
+            self.logger.log("Use model started: making automatic E decisions now.")
+
+            with mss.mss() as sct:
+                while self.running:
+                    features, state_info = self.sampler.sample(sct)
+                    threshold = float(self.threshold_var.get())
+                    prediction, prob_press = self.learner.predict(features, threshold)
+                    confidence = max(prob_press, 1.0 - prob_press)
+
+                    if prediction == 1:
+                        keyboard.press_and_release("e")
+                        action_text = "pressed E"
+                    else:
+                        action_text = "did not press E"
+
+                    predicted_text = "PRESS E NOW" if prediction == 1 else "DO NOT PRESS E"
+                    self.logger.log(
+                        f"Use model detected rgb=({state_info['r']},{state_info['g']},{state_info['b']}), "
+                        f"delta={state_info['delta']}, confidence {confidence:.2f}, prediction {predicted_text}; {action_text}."
+                    )
+
+                    self.root.after(
+                        0,
+                        lambda p=predicted_text: self.prediction_var.set(f"Prediction: {p}"),
+                    )
+                    self.root.after(
+                        0,
+                        lambda c=confidence: self.confidence_var.set(f"Confidence: {c:.2f}"),
+                    )
+
+                    time.sleep(float(self.sample_interval_var.get()))
+        except Exception as exc:
+            self.running = False
+            self.mode = "idle"
+            self.root.after(0, lambda: self.status_var.set(f"Error: {exc}"))
+            self.logger.log(f"Use model loop error: {exc}")
+        finally:
+            self.mode = "idle"
 
     def on_close(self) -> None:
         self.running = False
