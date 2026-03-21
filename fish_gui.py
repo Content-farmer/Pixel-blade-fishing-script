@@ -21,6 +21,7 @@ class TrainingStats:
     incorrect_predictions: int = 0
     reinforcement_count: int = 0
     penalty_count: int = 0
+    total_hold_seconds: float = 0.0
 
 
 class Logger:
@@ -109,7 +110,13 @@ class OnlineLearner:
         prediction = 1 if p >= threshold else 0
         return prediction, p
 
-    def update(self, features: list[float], true_label: int, predicted_label: int) -> tuple[bool, str]:
+    def update(
+        self,
+        features: list[float],
+        true_label: int,
+        predicted_label: int,
+        hold_ratio: float = 0.0,
+    ) -> tuple[bool, str]:
         """
         Update the model immediately after each labeled sample.
 
@@ -123,7 +130,8 @@ class OnlineLearner:
         reward_sign = 1.0 if matched else -1.0
 
         error = true_label - p
-        step = self.learning_rate * reward_sign * error
+        hold_boost = 1.0 + max(0.0, min(1.0, hold_ratio))
+        step = self.learning_rate * reward_sign * error * hold_boost
 
         for i in range(self.num_features):
             self.weights[i] += step * features[i]
@@ -143,15 +151,18 @@ class OnlineLearner:
     def load_dict(self, data: dict) -> bool:
         if not data:
             return False
-        if int(data.get("num_features", -1)) != self.num_features:
+        saved_num_features = int(data.get("num_features", -1))
+        if saved_num_features > self.num_features or saved_num_features <= 0:
             return False
 
         weights = data.get("weights", [])
-        if not isinstance(weights, list) or len(weights) != self.num_features:
+        if not isinstance(weights, list) or len(weights) != saved_num_features:
             return False
 
         self.learning_rate = float(data.get("learning_rate", self.learning_rate))
         self.weights = [float(v) for v in weights]
+        if saved_num_features < self.num_features:
+            self.weights.extend([0.0] * (self.num_features - saved_num_features))
         self.bias = float(data.get("bias", 0.0))
         return True
 
@@ -263,7 +274,8 @@ class AppGUI:
         self.penalty_var = tk.StringVar(value="Penalty count: 0")
 
         self.sampler = GameStateSampler(self.pixel_x_var.get(), self.pixel_y_var.get())
-        self.learner = OnlineLearner(num_features=8, learning_rate=self.learning_rate_var.get())
+        self.last_hold_ratio = 0.0
+        self.learner = OnlineLearner(num_features=9, learning_rate=self.learning_rate_var.get())
 
         self._build_layout()
         self._load_existing_state()
@@ -357,6 +369,7 @@ class AppGUI:
             incorrect_predictions=int(stats_blob.get("incorrect_predictions", 0)),
             reinforcement_count=int(stats_blob.get("reinforcement_count", 0)),
             penalty_count=int(stats_blob.get("penalty_count", 0)),
+            total_hold_seconds=float(stats_blob.get("total_hold_seconds", 0.0)),
         )
         self._refresh_stats_labels()
 
@@ -438,7 +451,8 @@ class AppGUI:
             messagebox.showwarning("Busy", "Stop training before resetting model.")
             return
 
-        self.learner = OnlineLearner(num_features=8, learning_rate=float(self.learning_rate_var.get()))
+        self.last_hold_ratio = 0.0
+        self.learner = OnlineLearner(num_features=9, learning_rate=float(self.learning_rate_var.get()))
         self.stats = TrainingStats()
         self._refresh_stats_labels()
         self.save_model()
@@ -446,25 +460,39 @@ class AppGUI:
         self.confidence_var.set("Confidence: 0.00")
         self.logger.log("Model and training statistics were reset.")
 
-    def _observe_player_response(self, response_window: float) -> int:
+    def _observe_player_response(self, response_window: float) -> tuple[int, float]:
         """
-        Observe whether player presses E during a short response window.
-        Returns 1 if pressed at least once, else 0.
+        Observe whether player presses E during a short response window and for how long.
+        Returns (pressed_flag, held_seconds).
         """
         start = time.time()
         pressed = 0
+        held_seconds = 0.0
+        press_started_at: float | None = None
+
         while time.time() - start < response_window and self.running:
-            if keyboard.is_pressed("e"):
+            is_down = keyboard.is_pressed("e")
+            if is_down:
                 pressed = 1
-                break
+                if press_started_at is None:
+                    press_started_at = time.time()
+            elif press_started_at is not None:
+                held_seconds += time.time() - press_started_at
+                press_started_at = None
             time.sleep(0.01)
-        return pressed
+
+        if press_started_at is not None:
+            held_seconds += time.time() - press_started_at
+
+        held_seconds = min(response_window, held_seconds)
+        return pressed, held_seconds
 
     def _training_loop(self) -> None:
         try:
             with mss.mss() as sct:
                 while self.running:
                     features, state_info = self.sampler.sample(sct)
+                    features.append(self.last_hold_ratio)
 
                     threshold = float(self.threshold_var.get())
                     prediction, prob_press = self.learner.predict(features, threshold)
@@ -472,11 +500,19 @@ class AppGUI:
                     predicted_text = "PRESS E NOW" if prediction == 1 else "DO NOT PRESS E"
 
                     response_window = float(self.response_window_var.get())
-                    player_pressed = self._observe_player_response(response_window)
+                    player_pressed, hold_seconds = self._observe_player_response(response_window)
+                    hold_ratio = hold_seconds / response_window if response_window > 0 else 0.0
 
-                    matched, reinforcement_label = self.learner.update(features, player_pressed, prediction)
+                    matched, reinforcement_label = self.learner.update(
+                        features,
+                        player_pressed,
+                        prediction,
+                        hold_ratio=hold_ratio,
+                    )
+                    self.last_hold_ratio = hold_ratio
 
                     self.stats.total_samples += 1
+                    self.stats.total_hold_seconds += hold_seconds
                     if matched:
                         self.stats.correct_predictions += 1
                         self.stats.reinforcement_count += 1
@@ -498,6 +534,10 @@ class AppGUI:
                     )
                     self.logger.log(
                         f"Player {player_text}, prediction {correctness_text}, applying {reinforcement_label}."
+                    )
+                    self.logger.log(
+                        f"E hold duration {hold_seconds:.3f}s in {response_window:.3f}s window "
+                        f"(ratio={hold_ratio:.2f}) used in learning."
                     )
 
                     self.root.after(
@@ -532,6 +572,7 @@ class AppGUI:
             with mss.mss() as sct:
                 while self.running:
                     features, state_info = self.sampler.sample(sct)
+                    features.append(self.last_hold_ratio)
                     threshold = float(self.threshold_var.get())
                     prediction, prob_press = self.learner.predict(features, threshold)
                     confidence = max(prob_press, 1.0 - prob_press)
