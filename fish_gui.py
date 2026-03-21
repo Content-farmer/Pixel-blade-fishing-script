@@ -11,7 +11,7 @@ class ColorWatcherApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Color Watcher Automation")
-        self.root.geometry("420x320")
+        self.root.geometry("420x460")
         self.root.resizable(False, False)
 
         self.running = False
@@ -33,6 +33,9 @@ class ColorWatcherApp:
         self.tap_count_var = tk.IntVar(value=10)
         self.tap_interval_var = tk.DoubleVar(value=0.30)
         self.status_var = tk.StringVar(value="Idle")
+        self.log_last_message = None
+        self.log_last_time = 0.0
+        self.log_min_interval = 0.8
 
         self.build_ui()
         keyboard.add_hotkey("f6", self.start)
@@ -93,6 +96,11 @@ class ColorWatcherApp:
 
         ttk.Label(self.root, textvariable=self.status_var, anchor="w").pack(fill="x", padx=12, pady=8)
 
+        logs = ttk.LabelFrame(self.root, text="Activity Log")
+        logs.pack(fill="both", expand=True, padx=10, pady=4)
+        self.log_text = tk.Text(logs, height=5, wrap="word", state="disabled")
+        self.log_text.pack(fill="both", expand=True, padx=6, pady=6)
+
         help_text = (
             "Fishing loop:\n"
             "1) Hold E to cast, release.\n"
@@ -144,14 +152,17 @@ class ColorWatcherApp:
 
     def action_cast(self, cast_hold):
         self.set_status("Casting rod (holding E)")
+        self.log_event("Casting rod.")
         self.hold_key("e", cast_hold)
 
     def action_green(self, green_hold):
         self.set_status("Green circle detected -> hold E")
+        self.log_event("Green detected. Holding E.")
         self.hold_key("e", green_hold)
 
     def action_blue(self, tap_count, tap_interval):
         self.set_status("Blue circle detected -> tapping E")
+        self.log_event("Blue detected. Tapping E sequence.")
         self.tap_key("e", tap_count, tap_interval)
 
     def wait_until_color_clears(self, sct, region, target, tolerance, max_wait=1.0):
@@ -185,8 +196,20 @@ class ColorWatcherApp:
                     if not self.running:
                         break
 
+                    first_green_seen = False
+                    self.log_event("Waiting for first green before blue checks.")
+
                     # Run green chain until blue center appears.
                     while self.running:
+                        if not first_green_seen:
+                            if self.region_contains_color(sct, region, green, tolerance):
+                                first_green_seen = True
+                                self.action_green(green_hold)
+                                self.wait_until_color_clears(sct, region, green, tolerance, max_wait=1.0)
+                            else:
+                                time.sleep(0.02)
+                            continue
+
                         if self.region_contains_color(sct, region, blue, tolerance):
                             self.action_blue(tap_count, tap_interval)
                             self.wait_until_color_clears(sct, region, blue, tolerance, max_wait=2.0)
@@ -201,10 +224,29 @@ class ColorWatcherApp:
 
         except Exception as e:
             self.set_status(f"Error: {e}")
+            self.log_event(f"Error: {e}", force=True)
             self.running = False
 
     def set_status(self, text):
         self.root.after(0, lambda: self.status_var.set(text))
+
+    def log_event(self, message, force=False):
+        now = time.time()
+        if not force and message == self.log_last_message and (now - self.log_last_time) < self.log_min_interval:
+            return
+        self.log_last_message = message
+        self.log_last_time = now
+        stamp = time.strftime("%H:%M:%S")
+        self.root.after(0, lambda: self.append_log_line(f"[{stamp}] {message}"))
+
+    def append_log_line(self, line):
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", line + "\n")
+        lines = int(self.log_text.index("end-1c").split(".")[0])
+        if lines > 200:
+            self.log_text.delete("1.0", "3.0")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
 
     def start(self):
         if self.running:
@@ -213,10 +255,12 @@ class ColorWatcherApp:
         self.worker = threading.Thread(target=self.worker_loop, daemon=True)
         self.worker.start()
         self.status_var.set("Started")
+        self.log_event("Automation started.", force=True)
 
     def stop(self):
         self.running = False
         self.status_var.set("Stopped")
+        self.log_event("Automation stopped.", force=True)
 
     def on_close(self):
         self.stop()
