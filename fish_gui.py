@@ -30,8 +30,10 @@ class ColorWatcherApp:
         self.tolerance_var = tk.IntVar(value=20)
         self.cast_hold_var = tk.DoubleVar(value=1.0)
         self.green_hold_var = tk.DoubleVar(value=1.5)
+        self.followup_green_hold_var = tk.DoubleVar(value=1.0)
         self.tap_count_var = tk.IntVar(value=10)
         self.tap_interval_var = tk.DoubleVar(value=0.30)
+        self.post_tap_wait_var = tk.DoubleVar(value=2.0)
         self.status_var = tk.StringVar(value="Idle")
         self.log_last_message = None
         self.log_last_time = 0.0
@@ -88,6 +90,12 @@ class ColorWatcherApp:
         ttk.Label(timings, text="Tap interval (s)").grid(row=1, column=2, **pad)
         ttk.Entry(timings, textvariable=self.tap_interval_var, width=8).grid(row=1, column=3, **pad)
 
+        ttk.Label(timings, text="Follow-up green hold (s)").grid(row=2, column=0, **pad)
+        ttk.Entry(timings, textvariable=self.followup_green_hold_var, width=8).grid(row=2, column=1, **pad)
+
+        ttk.Label(timings, text="Post-tap wait (s)").grid(row=2, column=2, **pad)
+        ttk.Entry(timings, textvariable=self.post_tap_wait_var, width=8).grid(row=2, column=3, **pad)
+
         controls = ttk.Frame(self.root)
         controls.pack(fill="x", padx=10, pady=12)
 
@@ -104,8 +112,9 @@ class ColorWatcherApp:
         help_text = (
             "Fishing loop:\n"
             "1) Hold E to cast, release.\n"
-            "2) When green circle appears, hold E and release.\n"
-            "3) When blue center appears, tap E repeatedly.\n"
+            "2) On first green circle, hold E and release.\n"
+            "3) On follow-up green circles, hold E using follow-up hold time.\n"
+            "4) When blue center appears, tap E repeatedly, then wait post-tap.\n"
             "Use F6 to start and F7 to stop."
         )
         ttk.Label(self.root, text=help_text, justify="left").pack(fill="x", padx=12, pady=6)
@@ -155,15 +164,21 @@ class ColorWatcherApp:
         self.log_event("Casting rod.")
         self.hold_key("e", cast_hold)
 
-    def action_green(self, green_hold):
-        self.set_status("Green circle detected -> hold E")
+    def action_green(self, green_hold, label="Green circle detected -> hold E"):
+        self.set_status(label)
         self.log_event("Green detected. Holding E.")
         self.hold_key("e", green_hold)
 
-    def action_blue(self, tap_count, tap_interval):
+    def action_blue(self, tap_count, tap_interval, post_tap_wait):
         self.set_status("Blue circle detected -> tapping E")
         self.log_event("Blue detected. Tapping E sequence.")
         self.tap_key("e", tap_count, tap_interval)
+        if self.running and post_tap_wait > 0:
+            self.set_status("Blue sequence complete -> waiting")
+            self.log_event(f"Blue sequence complete. Waiting {post_tap_wait:.1f}s.")
+            end_time = time.time() + post_tap_wait
+            while self.running and time.time() < end_time:
+                time.sleep(0.01)
 
     def wait_until_color_clears(self, sct, region, target, tolerance, max_wait=1.0):
         start_time = time.time()
@@ -180,8 +195,10 @@ class ColorWatcherApp:
             tolerance = self.tolerance_var.get()
             cast_hold = float(self.cast_hold_var.get())
             green_hold = float(self.green_hold_var.get())
+            followup_green_hold = float(self.followup_green_hold_var.get())
             tap_count = int(self.tap_count_var.get())
             tap_interval = float(self.tap_interval_var.get())
+            post_tap_wait = float(self.post_tap_wait_var.get())
 
             region = {
                 "left": self.x_var.get(),
@@ -204,19 +221,22 @@ class ColorWatcherApp:
                         if not first_green_seen:
                             if self.region_contains_color(sct, region, green, tolerance):
                                 first_green_seen = True
-                                self.action_green(green_hold)
+                                self.action_green(green_hold, label="First green circle detected -> hold E")
                                 self.wait_until_color_clears(sct, region, green, tolerance, max_wait=1.0)
                             else:
                                 time.sleep(0.02)
                             continue
 
                         if self.region_contains_color(sct, region, blue, tolerance):
-                            self.action_blue(tap_count, tap_interval)
+                            self.action_blue(tap_count, tap_interval, post_tap_wait)
                             self.wait_until_color_clears(sct, region, blue, tolerance, max_wait=2.0)
                             break
 
                         if self.region_contains_color(sct, region, green, tolerance):
-                            self.action_green(green_hold)
+                            self.action_green(
+                                followup_green_hold,
+                                label="Follow-up green circle detected -> 1s hold E",
+                            )
                             self.wait_until_color_clears(sct, region, green, tolerance, max_wait=1.0)
                             continue
 
